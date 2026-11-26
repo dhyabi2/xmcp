@@ -9,16 +9,25 @@
  * `nanoPaymentPayload` builds the payment to put in `_meta["x402/payment"]`
  * of the retried call.
  *
+ * A wallet that signs the send but leaves publishing to the server can pass
+ * the signed block instead: `nanoBlockPaymentPayload` checks it against the
+ * plan before it leaves the client, because a signed block in the server's
+ * hands is spent whether or not the call is served.
+ *
  * Nothing here signs, holds a key or talks to a node: signing and publishing
- * stay with the payer's wallet.
+ * stay with the payer's wallet (or, for a signed block, the server's node).
  */
 
 import { NANO_NETWORK_ID } from "./constants.js";
 import {
   NANO_BINDING_V1,
+  hashNanoStateBlock,
   isValidNanoAddress,
   isValidNanoOrderId,
+  nanoAddressToPublicKey,
   nanoOrderCommitment,
+  parseNanoStateBlock,
+  type NanoStateBlock,
 } from "./nano.js";
 
 /** What the payer's wallet has to send to pay one 402 offer on `nano` */
@@ -170,9 +179,95 @@ export function nanoPaymentPayload(
   if (!BLOCK_HASH_PATTERN.test(blockHash)) {
     throw new Error("blockHash must be 64 hex characters");
   }
-  const payload: Record<string, string> = {
-    blockHash: blockHash.toUpperCase(),
+  return paymentFor(plan, { blockHash: blockHash.toUpperCase() });
+}
+
+export interface NanoBlockPaymentOptions {
+  /**
+   * Balance of the payer's account before this send, in raw: the balance of
+   * the block named by the send's `previous`, as the wallet holds it
+   */
+  previousBalanceRaw: bigint | string;
+}
+
+/** A payment that carries the payer's signed send block */
+export interface NanoBlockPayment {
+  /** The value to put in `_meta["x402/payment"]` of the retried call */
+  payment: Record<string, unknown>;
+  /**
+   * Hash of the signed block. If the server answers that the block was
+   * published but not confirmed yet, retry with
+   * `nanoPaymentPayload(plan, blockHash)` instead of signing again.
+   */
+  blockHash: string;
+}
+
+/**
+ * The payment for a planned offer when the payer's wallet signed the send
+ * but did not publish it: the server publishes the block through its node.
+ * Before the block leaves the client it must be exactly what the plan says:
+ * a send (not an open block) to `payTo` of exactly `amountRaw`, counted from
+ * `previousBalanceRaw`, with the order-commitment representative when the
+ * offer is bound. Anything else throws, since a signed block is spent once
+ * the server has it.
+ */
+export function nanoBlockPaymentPayload(
+  plan: NanoPaymentPlan,
+  signedBlock: unknown,
+  options: NanoBlockPaymentOptions
+): NanoBlockPayment {
+  const block = parseNanoStateBlock(signedBlock);
+  if (!block) throw new Error("Not a signed Nano state block");
+  if (block.previous === ZERO_HASH) {
+    throw new Error("The block opens an account; a payment must be a send");
+  }
+  if (block.link.toUpperCase() !== nanoAddressToPublicKey(plan.payTo)) {
+    throw new Error(`The block does not pay ${plan.payTo}`);
+  }
+
+  const previousBalance = parseBalance(
+    options.previousBalanceRaw,
+    "previousBalanceRaw"
+  );
+  const sent = previousBalance - BigInt(block.balance);
+  if (sent !== BigInt(plan.amountRaw)) {
+    throw new Error(
+      `The block sends ${sent} raw; the plan is exactly ${plan.amountRaw} raw`
+    );
+  }
+
+  if (
+    plan.representative !== undefined &&
+    nanoAddressToPublicKey(block.representative) !==
+      nanoAddressToPublicKey(plan.representative)
+  ) {
+    throw new Error("The block is not bound to the planned order");
+  }
+
+  return {
+    payment: paymentFor(plan, { block }),
+    blockHash: hashNanoStateBlock(block),
   };
+}
+
+const ZERO_HASH = "0".repeat(64);
+
+/** A balance in raw; unlike a price it may be zero */
+function parseBalance(value: unknown, name: string): bigint {
+  const text = typeof value === "bigint" ? value.toString() : value;
+  if (typeof text !== "string" || !/^(0|[1-9][0-9]*)$/.test(text)) {
+    throw new Error(`${name} must be a whole number of raw`);
+  }
+  const raw = BigInt(text);
+  if (raw > MAX_RAW) throw new Error(`${name} is larger than any Nano balance`);
+  return raw;
+}
+
+function paymentFor(
+  plan: NanoPaymentPlan,
+  proof: { blockHash: string } | { block: NanoStateBlock }
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = { ...proof };
   if (plan.orderId !== undefined) payload.orderId = plan.orderId;
 
   if (plan.x402Version === 2) {

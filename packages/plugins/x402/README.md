@@ -294,6 +294,32 @@ its amount is above `maxAmountRaw`, or it names a binding other than
 `xno-binding/v1/rep`. The payment is made in the offer's x402 version and
 carries `orderId` for a bound offer.
 
+A wallet that signs the send but does not publish it can hand the signed
+block to the server instead (`payload.block`); the server publishes it
+through its node. `nanoBlockPaymentPayload` checks the block against the plan
+first, because a signed block is spent once the server has it:
+
+```typescript
+import { nanoBlockPaymentPayload } from "@xmcp-dev/x402";
+
+const signed = await wallet.signSend(plan); // your wallet, not published
+const { payment, blockHash } = nanoBlockPaymentPayload(plan, signed, {
+  previousBalanceRaw: wallet.balanceRaw, // balance before this send
+});
+
+await client.callTool({
+  name: "word-count",
+  arguments,
+  _meta: { "x402/payment": payment },
+});
+```
+
+The block is refused, and nothing is sent, unless it is a send (not an open
+block) to `plan.payTo` of exactly `plan.amountRaw` counted from
+`previousBalanceRaw`, and, for a bound offer, carries `plan.representative`.
+If the server answers that the block was published but is not confirmed yet,
+retry with `nanoPaymentPayload(plan, blockHash)` rather than signing again.
+
 ## License
 
 MIT
